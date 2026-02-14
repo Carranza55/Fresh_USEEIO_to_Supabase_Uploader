@@ -1,0 +1,20 @@
+# Env and secrets — do not commit
+.env
+.env.local
+.env.*.local
+
+# Venv
+.venv/
+venv/
+env/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+dist/
+build/
+
+# OS
+.DS_Store
