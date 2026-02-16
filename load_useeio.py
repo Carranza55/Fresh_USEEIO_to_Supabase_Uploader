@@ -3,6 +3,8 @@
 USEEIO xlsx → Supabase ETL.
 Reads M, M_d, SectorCrosswalk, Rho, indicators, commodities_meta from xlsx;
 melts to long where needed; inserts into Supabase with model_version.
+Auto-detects economic_year (demands sheet) and satellite year range (Rho columns)
+and writes to model_metadata (one row per model; is_active for UI).
 
 To add commodities_meta table in Supabase (SQL Editor), run:
   create table commodities_meta (
@@ -15,6 +17,8 @@ To add commodities_meta table in Supabase (SQL Editor), run:
     primary key (model_version, code)
   );
   -- Add any extra columns to match the sheet (lowercase, underscores).
+
+To add model_metadata table, run the statements in: supabase_model_metadata.sql
 """
 from __future__ import annotations
 
@@ -41,6 +45,7 @@ SHEET_RHO = "Rho"
 SHEET_M = "M"
 SHEET_M_D = "M_d"
 SHEET_COMMODITIES_META = "commodities_meta"
+SHEET_DEMANDS = "demands"
 BATCH_SIZE = 2000
 
 # Columns expected in Supabase commodities_meta table (sheet may have more; we only send these)
@@ -61,8 +66,66 @@ def get_sector_region(s: str) -> tuple[str, str]:
     return s, "US"
 
 
-def get_config() -> tuple[str, str, str, str]:
-    """Return (xlsx_path, model_version, supabase_url, supabase_key)."""
+def detect_years_from_xlsx(xlsx_path: str) -> tuple[int | None, int | None, int | None]:
+    """
+    Open the Excel file and detect:
+    - Economic Year: from the demands sheet (first non-null Year value).
+    - Satellite year range: from Rho sheet column headers (min/max of numeric columns).
+    Returns (economic_year, satellite_year_min, satellite_year_max).
+    """
+    economic_year: int | None = None
+    satellite_min: int | None = None
+    satellite_max: int | None = None
+
+    xl = pd.ExcelFile(xlsx_path)
+    sheet_names = [s.strip().lower() for s in xl.sheet_names]
+
+    # Economic Year from demands sheet
+    demands_name = next((s for s in xl.sheet_names if s.strip().lower() == SHEET_DEMANDS.lower()), None)
+    if demands_name:
+        try:
+            df_d = pd.read_excel(xlsx_path, sheet_name=demands_name, header=0)
+            df_d.columns = [str(c).strip() for c in df_d.columns]
+            year_col = next(
+                (c for c in df_d.columns if c.lower() in ("year", "economic year", "economic_year")),
+                None,
+            )
+            if year_col:
+                for val in df_d[year_col].dropna():
+                    try:
+                        economic_year = int(float(val))
+                        break
+                    except (ValueError, TypeError):
+                        continue
+        except Exception:
+            pass
+
+    # Satellite year range from Rho columns (first row is header; first col is sector, rest are years)
+    rho_sheet_name = next((s for s in xl.sheet_names if s.strip().lower() == SHEET_RHO.lower()), None)
+    if rho_sheet_name:
+        try:
+            rho_df = pd.read_excel(xlsx_path, sheet_name=rho_sheet_name, header=0, nrows=0)
+            sector_col = rho_df.columns[0]
+            years: list[int] = []
+            for c in rho_df.columns:
+                if c is sector_col or c == sector_col:
+                    continue
+                try:
+                    y = int(float(c))
+                    years.append(y)
+                except (ValueError, TypeError):
+                    continue
+            if years:
+                satellite_min = min(years)
+                satellite_max = max(years)
+        except Exception:
+            pass
+
+    return economic_year, satellite_min, satellite_max
+
+
+def get_config() -> tuple[str, str, str, str, int | None, int | None, int | None]:
+    """Return (xlsx_path, model_version, supabase_url, supabase_key, economic_year, satellite_year_min, satellite_year_max)."""
     xlsx = (
         os.environ.get(XLSX_PATH_ENV)
         or (sys.argv[1] if len(sys.argv) > 1 else None)
@@ -88,7 +151,8 @@ def get_config() -> tuple[str, str, str, str]:
         raise SystemExit(
             f"Set {SUPABASE_URL_ENV} and {SUPABASE_KEY_ENV} (or SUPABASE_KEY) in .env"
         )
-    return xlsx, model_version, url, key
+    economic_year, satellite_year_min, satellite_year_max = detect_years_from_xlsx(xlsx)
+    return xlsx, model_version, url, key, economic_year, satellite_year_min, satellite_year_max
 
 
 def load_indicators(xlsx_path: str, model_version: str) -> pd.DataFrame:
@@ -203,8 +267,43 @@ def insert_in_batches(client, table: str, df: pd.DataFrame, batch_size: int = BA
         client.table(table).insert(chunk).execute()
 
 
+def load_model_metadata(
+    client,
+    model_version: str,
+    economic_year: int | None,
+    satellite_year_min: int | None,
+    satellite_year_max: int | None,
+) -> None:
+    """
+    Insert or update model_metadata for this model_version and set is_active = true.
+    All other model_versions are set to is_active = false.
+    """
+    record = {
+        "model_version": model_version,
+        "economic_year": economic_year,
+        "satellite_year_min": satellite_year_min,
+        "satellite_year_max": satellite_year_max,
+        "is_active": True,
+    }
+    try:
+        client.table("model_metadata").upsert(
+            record,
+            on_conflict="model_version",
+            ignore_duplicates=False,
+        ).execute()
+        # Ensure only this model is active
+        client.table("model_metadata").update({"is_active": False}).neq(
+            "model_version", model_version
+        ).execute()
+    except APIError as e:
+        if e.code == "PGRST205":
+            print("  Skipped model_metadata (table not in Supabase yet). Run the provided SQL to create it.")
+        else:
+            raise
+
+
 def delete_model_version(client, model_version: str) -> None:
-    for table in ("impacts", "rho", "sector_crosswalk", "commodities_meta", "indicators"):
+    for table in ("impacts", "rho", "sector_crosswalk", "commodities_meta", "indicators", "model_metadata"):
         try:
             client.table(table).delete().eq("model_version", model_version).execute()
             print(f"  Cleared table: {table}")
@@ -216,15 +315,20 @@ def delete_model_version(client, model_version: str) -> None:
 
 
 def main() -> None:
-    xlsx_path, model_version, supabase_url, supabase_key = get_config()
+    xlsx_path, model_version, supabase_url, supabase_key, economic_year, satellite_year_min, satellite_year_max = get_config()
     client = create_client(supabase_url, supabase_key)
 
     print(f"Model version: {model_version}")
-    print(f"XLSX: {xlsx_path}\n")
+    print(f"XLSX: {xlsx_path}")
+    print(f"Detected: economic_year={economic_year}, satellite_years={satellite_year_min}-{satellite_year_max}\n")
 
     print("Removing existing data for this model version...")
     delete_model_version(client, model_version)
     print("  Done.\n")
+
+    print("Loading model_metadata...")
+    load_model_metadata(client, model_version, economic_year, satellite_year_min, satellite_year_max)
+    print("  Table 'model_metadata' updated.\n")
 
     print("Loading indicators...")
     ind_df = load_indicators(xlsx_path, model_version)
