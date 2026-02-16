@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 USEEIO xlsx → Supabase ETL.
-Reads M, M_d, SectorCrosswalk, Rho, indicators, commodities_meta from xlsx;
+Reads M, M_d, C, SectorCrosswalk, Rho, indicators, commodities_meta from xlsx;
 melts to long where needed; inserts into Supabase with model_version.
 Auto-detects economic_year (demands sheet) and satellite year range (Rho columns)
 and writes to model_metadata (one row per model; is_active for UI).
@@ -20,6 +20,7 @@ To add commodities_meta table in Supabase (SQL Editor), run:
 
 To add model_metadata table, run the statements in: supabase_model_metadata.sql
 To add ipcc_ar_gwp table (IPCC AR GWP factors), run: supabase_ipcc_ar_gwp.sql
+To add c table (characterization matrix for GWP per flow from sheet C), run: SQL Backup/supabase_c.sql
 """
 from __future__ import annotations
 
@@ -45,6 +46,7 @@ SHEET_SECTOR_CROSSWALK = "SectorCrosswalk"
 SHEET_RHO = "Rho"
 SHEET_M = "M"
 SHEET_M_D = "M_d"
+SHEET_C = "C"
 SHEET_COMMODITIES_META = "commodities_meta"
 SHEET_DEMANDS = "demands"
 BATCH_SIZE = 2000
@@ -793,6 +795,55 @@ def load_impact_long(
     return pd.DataFrame(rows)
 
 
+def load_c_matrix_long(
+    xlsx_path: str,
+    model_version: str,
+    index_to_code: dict[int, str],
+) -> pd.DataFrame:
+    """
+    Load the C (characterization) matrix from the workbook.
+    C has flow names as columns (e.g. "Methane/emission/air/kg") and one row per impact indicator;
+    values are characterization factors (e.g. GWP). Used to determine GWP per flow.
+    Sheet layout: header = flow names; first column may be indicator code; data = factors.
+    """
+    df = pd.read_excel(xlsx_path, sheet_name=SHEET_C, header=0)
+    all_cols = list(df.columns)
+    # First column may be indicator code or index; rest are flow names
+    first_col = all_cols[0]
+    flow_cols = [c for c in all_cols if c != first_col]
+    rows = []
+    for i, (_, row) in enumerate(df.iterrows()):
+        # Indicator: from first column if it looks like a code (not a number), else from row index
+        ind_val = row.get(first_col)
+        if pd.notna(ind_val):
+            s = str(ind_val).strip()
+            if s and not s.replace(".", "").replace("-", "").isdigit():
+                indicator_code = s
+            else:
+                indicator_code = index_to_code.get(int(i))
+        else:
+            indicator_code = index_to_code.get(int(i))
+        if indicator_code is None:
+            continue
+        for flow in flow_cols:
+            val = row.get(flow)
+            if pd.isna(val):
+                continue
+            try:
+                value = float(val)
+            except (TypeError, ValueError):
+                continue
+            rows.append(
+                {
+                    "model_version": model_version,
+                    "indicator_code": indicator_code,
+                    "flow": str(flow).strip(),
+                    "value": value,
+                }
+            )
+    return pd.DataFrame(rows)
+
+
 def insert_in_batches(client, table: str, df: pd.DataFrame, batch_size: int = BATCH_SIZE):
     records = df.replace({pd.NA: None}).to_dict("records")
     for i in range(0, len(records), batch_size):
@@ -873,7 +924,7 @@ def load_ipcc_ar_gwp(client) -> None:
 
 
 def delete_model_version(client, model_version: str) -> None:
-    for table in ("impacts", "rho", "sector_crosswalk", "commodities_meta", "indicators", "model_metadata"):
+    for table in ("impacts", "c", "rho", "sector_crosswalk", "commodities_meta", "indicators", "model_metadata"):
         try:
             client.table(table).delete().eq("model_version", model_version).execute()
             print(f"  Cleared table: {table}")
@@ -948,6 +999,14 @@ def main() -> None:
     md_df = load_impact_long(xlsx_path, SHEET_M_D, "domestic", model_version, index_to_code)
     insert_in_batches(client, "impacts", md_df)
     print(f"  Table 'impacts' updated: {len(md_df)} rows inserted (domestic).\n")
+
+    print("Loading C (characterization / GWP)...")
+    try:
+        c_df = load_c_matrix_long(xlsx_path, model_version, index_to_code)
+        insert_in_batches(client, "c", c_df)
+        print(f"  Table 'c' updated: {len(c_df)} rows inserted (flow × indicator factors).\n")
+    except Exception as e:
+        print(f"  Skipped C: {e}\n")
 
     print("Done. All tables updated.")
 
